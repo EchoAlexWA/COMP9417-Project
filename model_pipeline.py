@@ -5,12 +5,15 @@ import pandas as pd
 import numpy as np
 from ucimlrepo import fetch_ucirepo
 from sklearn.pipeline import Pipeline
+from skopt import BayesSearchCV
+from sklearn.model_selection import PredefinedSplit
 
 FEATURES = ['PT08.S1(CO)', 'PT08.S2(NMHC)', 'PT08.S3(NOx)', 'PT08.S4(NO2)', 
             'PT08.S5(O3)', 'T', 'RH', 'AH']
 TARGET = ['NMHC(GT)', 'CO(GT)', 'C6H6(GT)', 'NOx(GT)', 'NO2(GT)']
+VALIDATION_PORTION = 0.2
 
-def get_train_test() -> pd.DataFrame:
+def get_train_test(if_NMHC: bool=False) -> pd.DataFrame:
     air_quality = fetch_ucirepo(id=360)
     origin = air_quality.data.features
     # process data
@@ -23,9 +26,59 @@ def get_train_test() -> pd.DataFrame:
     origin=origin[['NMHC(GT)', 'CO(GT)', 'NO2(GT)', 'NOx(GT)', 'C6H6(GT)',
                'PT08.S1(CO)', 'PT08.S2(NMHC)', 'PT08.S3(NOx)', 
                'PT08.S4(NO2)', 'PT08.S5(O3)', 'T', 'RH', 'AH']]
-    train_dataset = origin[:'2004-12-31 23:00:00']
-    test_dataset = origin['2005-01-01 00:00:00':]
+    if not if_NMHC:
+        train_dataset = origin[:'2004-12-31 23:00:00']
+        test_dataset = origin['2005-01-01 00:00:00':]
+    else:
+        no_nan_max = origin['NMHC(GT)'].dropna().index.max()
+        origin = origin.loc[:no_nan_max]
+        train_dataset = origin.iloc[:int(len(origin) * 0.8)]
+        test_dataset = origin.iloc[int(len(origin) * 0.8):]
     return train_dataset, test_dataset
+
+def select_non_nan_rows(X, Y):
+    mask = Y.notna().all(axis=1) & X.notna().all(axis=1)
+    return X[mask], Y[mask]
+
+def preprocess_data(train_dataset, test_dataset, target_col, params: dict):
+    col = target_col
+    lags = params.get('lags', [1,3,6,12,24])
+    window_sizes = params.get('window_sizes', [3,6,12])
+
+    X_train, Y_train = train_dataset[FEATURES], train_dataset[[col]]  # Drop NaN in target for training set
+    Y_train = pd.concat([Y_train.shift(-i) for i in [1,6,12,24]], axis=1)
+    X_test, Y_test = test_dataset[FEATURES], test_dataset[[col]]  # Drop NaN in target for test set
+    Y_test = pd.concat([Y_test.shift(-i) for i in [0,1,6,12,24]], axis=1)
+    Y_test.columns = [Y_test.columns[0] + f"_t+{i}" for i in [0,1,6,12,24]]
+
+    data_preprocessing_pipeline = Pipeline(steps=[
+        ('missing', MissingValueTransformer()),
+        ('features', CreateFeaturesTransformer(lags=lags, window_sizes=window_sizes)),
+    ])
+
+    X_train = data_preprocessing_pipeline.fit_transform(X_train)
+    X_test = data_preprocessing_pipeline.transform(X_test)
+    X_train, Y_train = select_non_nan_rows(X_train, Y_train)
+    X_test, Y_test = select_non_nan_rows(X_test, Y_test)
+    return X_train, Y_train, X_test, Y_test
+
+def data_formatted(train_dataset, test_dataset, target_column, params: dict):
+    '''
+    Prepare data for model training and evaluation
+    '''
+
+    X_train, Y_train, X_test, Y_test = preprocess_data(train_dataset, test_dataset, target_column, params)
+    X_train = X_train.to_numpy()
+    Y_train = Y_train.to_numpy()
+    scaler_Y = MinMaxScaler()
+    Y_train = scaler_Y.fit_transform(Y_train)
+    X_test = X_test.to_numpy()
+    Y_baseline = Y_test.to_numpy()[:, 0]
+    Y_test = Y_test.to_numpy()[:, 1:]
+    Y_baseline = Y_baseline.reshape(-1, 1).repeat(axis=1, repeats=Y_test.shape[1])
+    Y_test = scaler_Y.transform(Y_test)
+    return X_train, Y_train, X_test, Y_test, Y_baseline, scaler_Y
+
 
 class MissingValueTransformer(BaseEstimator, TransformerMixin):
     def __init__(self):
@@ -94,23 +147,54 @@ class CreateFeaturesTransformer(BaseEstimator, TransformerMixin):
         combined_features = pd.concat([X, lagged_features, rolling_features, cyc_features], axis=1)
         return combined_features
     
-def select_non_nan_rows(X, Y):
-    mask = Y.notna().all(axis=1) & X.notna().all(axis=1)
-    return X[mask], Y[mask]
 
-def preprocess_data(train_dataset, test_dataset, target_col):
-    col = target_col
 
-    X_train, Y_train = train_dataset[FEATURES], train_dataset[[col]]  # Drop NaN in target for training set
-    X_test, Y_test = test_dataset[FEATURES], test_dataset[[col]]  # Drop NaN in target for test set
+def searcher_builder(hyperspace: dict, model,len_train: int, iters=30, random_state=42, reg=True) -> BayesSearchCV:
+    '''
+    Build and return the hyperparameter searcher
+    '''
 
-    data_preprocessing_pipeline = Pipeline(steps=[
-        ('missing', MissingValueTransformer()),
-        ('features', CreateFeaturesTransformer(lags=[1,3,6,12,24], window_sizes=[3,6,12])),
+    ps = PredefinedSplit(
+        test_fold=[
+            -1 if i < int((1 - VALIDATION_PORTION) * len_train) else 0
+            for i in range(len_train)
+        ]
+    )
+
+    pipeline = Pipeline(steps=[
+        ('scaler', MinMaxScaler()),
+        ('model', model)
     ])
 
-    X_train = data_preprocessing_pipeline.fit_transform(X_train)
-    X_test = data_preprocessing_pipeline.transform(X_test)
-    X_train, Y_train = select_non_nan_rows(X_train, Y_train)
-    X_test, Y_test = select_non_nan_rows(X_test, Y_test)
-    return X_train, Y_train, X_test, Y_test
+    opt = BayesSearchCV(
+        estimator=pipeline,  
+        search_spaces=hyperspace,
+        cv=ps,
+        n_iter=iters,
+        random_state=random_state,
+        scoring='neg_root_mean_squared_error' if reg else 'neg_cross_entropy',
+    )
+    return opt
+
+def get_metrics(opt: BayesSearchCV, X_test, Y_test, Y_baseline, scaler_Y, column_name: str):
+    '''
+    Get metrics for the best model
+    '''
+    best_model = opt.best_estimator_
+    Y_pred = best_model.predict(X_test)
+    Y_pred = scaler_Y.inverse_transform(Y_pred)
+    Y_test = scaler_Y.inverse_transform(Y_test)
+
+    metrics = {}
+    metrics['column'] = column_name
+    metrics['Y_pred'] = Y_pred
+    metrics['Y_test'] = Y_test
+    metrics['best_params'] = opt.best_params_
+    metrics['rmse'] = np.sqrt(np.mean((Y_pred - Y_test)**2))
+    baseline_rmse=np.sqrt(np.mean((Y_baseline - Y_test)**2, axis=0))
+    metrics['improvement_over_baseline_percentage'] = ((baseline_rmse - metrics['rmse'])/baseline_rmse*100)
+    try:
+        metrics['best_model_training_loss_curve'] = best_model['model'].train_loss_curve_
+    except AttributeError:
+        metrics['best_model_training_loss_curve'] = None
+    return metrics
