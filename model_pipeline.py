@@ -47,6 +47,7 @@ def preprocess_data(train_dataset, test_dataset, target_col, params: dict):
 
     X_train, Y_train = train_dataset[FEATURES], train_dataset[[col]]  # Drop NaN in target for training set
     Y_train = pd.concat([Y_train.shift(-i) for i in [1,6,12,24]], axis=1)
+    Y_train.columns = [Y_train.columns[0] + f"_t+{i}" for i in [1,6,12,24]]
     X_test, Y_test = test_dataset[FEATURES], test_dataset[[col]]  # Drop NaN in target for test set
     Y_test = pd.concat([Y_test.shift(-i) for i in [0,1,6,12,24]], axis=1)
     Y_test.columns = [Y_test.columns[0] + f"_t+{i}" for i in [0,1,6,12,24]]
@@ -62,22 +63,49 @@ def preprocess_data(train_dataset, test_dataset, target_col, params: dict):
     X_test, Y_test = select_non_nan_rows(X_test, Y_test)
     return X_train, Y_train, X_test, Y_test
 
-def data_formatted(train_dataset, test_dataset, target_column, params: dict):
+def data_formatted(train_dataset, test_dataset, target_column, params: dict, reg: bool=True):
     '''
     Prepare data for model training and evaluation
     '''
+    if reg:
+        X_train, Y_train, X_test, Y_test = preprocess_data(train_dataset, test_dataset, target_column, params)
+        X_train = X_train.to_numpy()
+        Y_train = Y_train.to_numpy()
+        scaler_Y = MinMaxScaler()
+        Y_train = scaler_Y.fit_transform(Y_train)
+        X_test = X_test.to_numpy()
+        Y_baseline = Y_test.to_numpy()[:, 0]
+        Y_test = Y_test.to_numpy()[:, 1:]
+        Y_baseline = Y_baseline.reshape(-1, 1).repeat(axis=1, repeats=Y_test.shape[1])
+        Y_test = scaler_Y.transform(Y_test)
+        return X_train, Y_train, X_test, Y_test, Y_baseline, scaler_Y
+    else:
+        X_train, Y_train, X_test, Y_test = preprocess_data(train_dataset, test_dataset, target_column, params)
+        X_train = X_train.to_numpy()
+        for col in Y_train.columns:
+            Y_train[col+'class'] = pd.cut(
+                Y_train[col],
+                bins=[-float('inf'), 1.5, 2.5, float('inf')],  # 边界
+                labels=['low', 'mid', 'high'],                # 类别名称
+                right=False                                   # 区间左闭右开 [ )
+            ).cat.codes
+        Y_train.drop(columns=Y_train.columns[:len(Y_train.columns)//2], inplace=True)
+        Y_train = Y_train.to_numpy()
 
-    X_train, Y_train, X_test, Y_test = preprocess_data(train_dataset, test_dataset, target_column, params)
-    X_train = X_train.to_numpy()
-    Y_train = Y_train.to_numpy()
-    scaler_Y = MinMaxScaler()
-    Y_train = scaler_Y.fit_transform(Y_train)
-    X_test = X_test.to_numpy()
-    Y_baseline = Y_test.to_numpy()[:, 0]
-    Y_test = Y_test.to_numpy()[:, 1:]
-    Y_baseline = Y_baseline.reshape(-1, 1).repeat(axis=1, repeats=Y_test.shape[1])
-    Y_test = scaler_Y.transform(Y_test)
-    return X_train, Y_train, X_test, Y_test, Y_baseline, scaler_Y
+        X_test = X_test.to_numpy()
+        for col in Y_test.columns:
+            Y_test[col+'class'] = pd.cut(
+                Y_test[col],
+                bins=[-float('inf'), 1.5, 2.5, float('inf')],  # 边界
+                labels=['low', 'mid', 'high'],                # 类别名称
+                right=False                                   # 区间左闭右开 [ )
+            ).cat.codes
+        Y_test.drop(columns=Y_test.columns[:len(Y_test.columns)//2], inplace=True)
+        Y_test = Y_test.to_numpy()
+        Y_baseline = Y_test[:, 0]
+        Y_test = Y_test[:, 1:]
+        Y_baseline = Y_baseline.reshape(-1, 1).repeat(axis=1, repeats=Y_test.shape[1])
+        return X_train, Y_train, X_test, Y_test, Y_baseline, None
 
 
 class MissingValueTransformer(BaseEstimator, TransformerMixin):
@@ -172,7 +200,7 @@ def searcher_builder(hyperspace: dict, model,len_train: int, iters=30, random_st
         cv=ps,
         n_iter=iters,
         random_state=random_state,
-        scoring='neg_root_mean_squared_error' if reg else 'neg_cross_entropy',
+        scoring='neg_root_mean_squared_error' if reg else 'accuracy',
     )
     return opt
 
@@ -193,6 +221,30 @@ def get_metrics(opt: BayesSearchCV, X_test, Y_test, Y_baseline, scaler_Y, column
     metrics['rmse'] = np.sqrt(np.mean((Y_pred - Y_test)**2))
     baseline_rmse=np.sqrt(np.mean((Y_baseline - Y_test)**2, axis=0))
     metrics['improvement_over_baseline_percentage'] = ((baseline_rmse - metrics['rmse'])/baseline_rmse*100)
+    try:
+        metrics['best_model_training_loss_curve'] = best_model['model'].train_loss_curve_
+    except AttributeError:
+        metrics['best_model_training_loss_curve'] = None
+    return metrics
+
+def get_classification_metrics(opt: BayesSearchCV, X_test, Y_test, Y_baseline, column_name: str):
+    '''
+    Get metrics for the best classification model
+    '''
+    from sklearn.metrics import accuracy_score, classification_report
+
+    best_model = opt.best_estimator_
+    Y_pred = best_model.predict(X_test)
+
+    metrics = {}
+    metrics['column'] = column_name
+    metrics['Y_pred'] = Y_pred
+    metrics['Y_test'] = Y_test
+    metrics['best_params'] = opt.best_params_
+    metrics['accuracy'] = accuracy_score(Y_test, Y_pred)
+    baseline_accuracy = accuracy_score(Y_test, Y_baseline)
+    metrics['improvement_over_baseline_percentage'] = ((metrics['accuracy'] - baseline_accuracy)/baseline_accuracy*100)
+    metrics['classification_report'] = classification_report(Y_test, Y_pred)
     try:
         metrics['best_model_training_loss_curve'] = best_model['model'].train_loss_curve_
     except AttributeError:

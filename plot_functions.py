@@ -46,3 +46,15 @@ def plot_scatter_each_column_highlight_missing(dataset, imputed_dataset):
         plt.title(f"Imputed values highlighted in red: {col}")
         plt.legend()
         plt.show()
+
+
+def plot_pred_vs_true(timestamps, y_true, y_pred, title="Predicted vs Observed"):
+    plt.figure(figsize=(14, 4))
+    plt.plot(timestamps, y_true, label="Observed", linewidth=1)
+    plt.plot(timestamps, y_pred, label="Predicted", linewidth=1)
+    plt.title(title)
+    plt.xlabel("Time")
+    plt.ylabel("Value")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
