@@ -1,19 +1,28 @@
 from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.ensemble import IsolationForest
 from sklearn.impute import KNNImputer
 from sklearn.preprocessing import MinMaxScaler
 import pandas as pd
 import numpy as np
+from torch.backends.cudnn import enabled
 from ucimlrepo import fetch_ucirepo
 from sklearn.pipeline import Pipeline
 from skopt import BayesSearchCV
 from sklearn.model_selection import PredefinedSplit
 
+# region constants
+def __constants__():
+    pass
 FEATURES = ['PT08.S1(CO)', 'PT08.S2(NMHC)', 'PT08.S3(NOx)', 'PT08.S4(NO2)', 
             'PT08.S5(O3)', 'T', 'RH', 'AH']
 TARGET = ['NMHC(GT)', 'CO(GT)', 'C6H6(GT)', 'NOx(GT)', 'NO2(GT)']
 VALIDATION_PORTION = 0.2
+# endregion
 
-def get_train_test(if_NMHC: bool=False) -> pd.DataFrame:
+# region data processing functions
+def __data_processing_functions__():
+    pass
+def basic_preprocess():
     air_quality = fetch_ucirepo(id=360)
     origin = air_quality.data.features
     # process data
@@ -24,11 +33,23 @@ def get_train_test(if_NMHC: bool=False) -> pd.DataFrame:
     origin.set_index('Datetime', inplace=True)
     origin = origin.sort_index(axis=1)
     origin=origin[['NMHC(GT)', 'CO(GT)', 'NO2(GT)', 'NOx(GT)', 'C6H6(GT)',
-               'PT08.S1(CO)', 'PT08.S2(NMHC)', 'PT08.S3(NOx)', 
+               'PT08.S1(CO)', 'PT08.S2(NMHC)', 'PT08.S3(NOx)',
                'PT08.S4(NO2)', 'PT08.S5(O3)', 'T', 'RH', 'AH']]
+    return origin
+
+def get_train_test(path:str='origin_data/air_quality_raw.csv' ,if_NMHC: bool=False) -> pd.DataFrame:
+    origin = pd.read_csv(
+        path,
+        parse_dates=["Datetime"],  # 指定第一列转换为 datetime
+        index_col="Datetime",  # 设置为 index
+    )
+
     if not if_NMHC:
-        train_dataset = origin[:'2004-12-31 23:00:00']
-        test_dataset = origin['2005-01-01 00:00:00':]
+        origin['Year'] = origin.index.year
+        train_dataset = origin[origin['Year'] < 2005]
+        test_dataset = origin[origin['Year'] >= 2005]
+        train_dataset = train_dataset.drop(columns=['Year'])
+        test_dataset = test_dataset.drop(columns=['Year'])
     else:
         no_nan_max = origin['NMHC(GT)'].dropna().index.max()
         origin = origin.loc[:no_nan_max]
@@ -44,20 +65,23 @@ def preprocess_data(train_dataset, test_dataset, target_col, params: dict):
     col = target_col
     lags = params.get('lags', [1,3,6,12,24])
     window_sizes = params.get('window_sizes', [3,6,12])
+    enabled = params.get('anomaly_detection_enabled', False)
 
-    X_train, Y_train = train_dataset[FEATURES], train_dataset[[col]]  # Drop NaN in target for training set
+    X_train, Y_train = train_dataset[FEATURES], train_dataset[[col]]
     Y_train = pd.concat([Y_train.shift(-i) for i in [1,6,12,24]], axis=1)
     Y_train.columns = [Y_train.columns[0] + f"_t+{i}" for i in [1,6,12,24]]
-    X_test, Y_test = test_dataset[FEATURES], test_dataset[[col]]  # Drop NaN in target for test set
+    X_test, Y_test = test_dataset[FEATURES], test_dataset[[col]]
     Y_test = pd.concat([Y_test.shift(-i) for i in [0,1,6,12,24]], axis=1)
     Y_test.columns = [Y_test.columns[0] + f"_t+{i}" for i in [0,1,6,12,24]]
 
     data_preprocessing_pipeline = Pipeline(steps=[
         ('missing', MissingValueTransformer()),
+        ('anomaly', IsolationForestFilter(contamination=0.01, enabled=enabled)),
         ('features', CreateFeaturesTransformer(lags=lags, window_sizes=window_sizes)),
     ])
 
     X_train = data_preprocessing_pipeline.fit_transform(X_train)
+    data_preprocessing_pipeline.set_params(anomaly__enabled=False)
     X_test = data_preprocessing_pipeline.transform(X_test)
     X_train, Y_train = select_non_nan_rows(X_train, Y_train)
     X_test, Y_test = select_non_nan_rows(X_test, Y_test)
@@ -106,8 +130,11 @@ def data_formatted(train_dataset, test_dataset, target_column, params: dict, reg
         Y_test = Y_test[:, 1:]
         Y_baseline = Y_baseline.reshape(-1, 1).repeat(axis=1, repeats=Y_test.shape[1])
         return X_train, Y_train, X_test, Y_test, Y_baseline, None
+# endregion
 
-
+# region custom transformers
+def __custom_transformers__():
+    pass
 class MissingValueTransformer(BaseEstimator, TransformerMixin):
     def __init__(self):
         self.scaler = MinMaxScaler()
@@ -121,7 +148,7 @@ class MissingValueTransformer(BaseEstimator, TransformerMixin):
         self.imputer.fit(X_scaled)
         return self
 
-    def transform(self, X: pd.DataFrame):
+    def transform(self, X: pd.DataFrame, Y: pd.DataFrame=None):
         X_scaled = pd.DataFrame(self.scaler.transform(X), 
                                 columns=X.columns, 
                                 index=X.index)
@@ -129,22 +156,44 @@ class MissingValueTransformer(BaseEstimator, TransformerMixin):
                                  columns=X.columns, 
                                  index=X.index)
         return X_imputed
+
+class IsolationForestFilter(BaseEstimator, TransformerMixin):
+    def __init__(self, contamination=0.01, random_state=42, enabled=False):
+        self.enabled = enabled
+        self.contamination = contamination
+        self.random_state = random_state
+        self.model = IsolationForest(contamination=contamination, random_state=random_state)
+
+    def fit(self, X, y=None):
+        if not self.enabled:
+            return self
+        self.model.fit(X)
+        return self
+
+    def transform(self, X, Y=None):
+        if not self.enabled:
+            return X
+        labels = self.model.predict(X)
+        mask = (labels == 1)
+        mask = np.asarray(mask).ravel()
+        return X[mask]
+
     
 class CreateFeaturesTransformer(BaseEstimator, TransformerMixin):
     def __init__(self, lags: list, window_sizes: list):
-        self.lags_ = lags
-        self.window_sizes_ = window_sizes
+        self.lags = lags
+        self.window_sizes = window_sizes
 
     def fit(self, X: pd.DataFrame, Y: pd.DataFrame=None):
-        self.columns_ = X.columns
+        self.columns = X.columns
         return self
     
 
     def create_lagged_features(self, X:pd.DataFrame) -> pd.DataFrame:
         lagged_data = pd.DataFrame(index=X.index)
         lagged_features = {}
-        for col in self.columns_:
-            for lag in self.lags_:
+        for col in self.columns:
+            for lag in self.lags:
                 lagged_col_name = f"{col}_lag{lag}"
                 lagged_features[lagged_col_name] = X[col].shift(lag)
         lagged_data = pd.concat([pd.DataFrame(lagged_features)], axis=1)
@@ -152,8 +201,8 @@ class CreateFeaturesTransformer(BaseEstimator, TransformerMixin):
 
     def create_rolling_features(self, X:pd.DataFrame) -> pd.DataFrame:
         rolling_data = pd.DataFrame(index=X.index)
-        for col in self.columns_:
-            for window in self.window_sizes_:
+        for col in self.columns:
+            for window in self.window_sizes:
                 rolling_col_name = f"{col}_roll{window}"
                 rolling_data[rolling_col_name] = X[col].rolling(window=window, min_periods=1).mean()
         return rolling_data
@@ -168,15 +217,17 @@ class CreateFeaturesTransformer(BaseEstimator, TransformerMixin):
         cyc_data['Month_cos'] = np.cos(2 * np.pi * (X.index.month - 1) / 12)
         return cyc_data
 
-    def transform(self, X: pd.DataFrame):
+    def transform(self, X: pd.DataFrame, Y: pd.DataFrame=None):
         lagged_features = self.create_lagged_features(X)
         rolling_features = self.create_rolling_features(X)
         cyc_features = self.create_cyc_features(X)
         combined_features = pd.concat([X, lagged_features, rolling_features, cyc_features], axis=1)
         return combined_features
-    
+# endregion
 
-
+# region model training and evaluation functions
+def __model_training_and_evaluation_functions__():
+    pass
 def searcher_builder(hyperspace: dict, model,len_train: int, iters=30, random_state=42, reg=True) -> BayesSearchCV:
     '''
     Build and return the hyperparameter searcher
@@ -250,3 +301,4 @@ def get_classification_metrics(opt: BayesSearchCV, X_test, Y_test, Y_baseline, c
     except AttributeError:
         metrics['best_model_training_loss_curve'] = None
     return metrics
+# endregion
